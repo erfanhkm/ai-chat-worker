@@ -1,0 +1,7 @@
+name = "ai-chat"
+main = "worker.js"
+compatibility_date = "2026-10-19"
+
+[[kv_namespaces]]
+binding = "STATE"
+id = "5f4b702306cf4f08a1e1dcd743158fd1"
