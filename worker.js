@@ -466,3 +466,4 @@ export default {
     }
   }
 };
+// Deployed via Cloudflare Workers Builds (connected 2026-10-19).
