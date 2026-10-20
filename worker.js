@@ -25,14 +25,11 @@ const CF_ACCOUNT_ID_DEFAULT = '216209568308b78b6b59c701b4da03f1';
 const DAILY_CHAT_BUDGET = 700;
 const DAILY_SEARCH_BUDGET = 150;
 
-// NOTE: 'null' deliberately NOT allowlisted (sandboxed iframes/data: URLs send
-// Origin: null). POST requires an allowlisted Origin; the hourly probe sends one.
 const ALLOWED_ORIGINS = [
   'https://real-estate-platform-0aei.onrender.com',
   'https://muse.ai'
 ];
 
-// First that answers wins. 429/quota/empty -> next. Missing key -> skipped.
 const PROVIDERS = [
   { name: 'requesty-gemma', url: 'https://router.requesty.ai/v1/chat/completions', key: 'REQUESTY_API_KEY', model: 'gemma-4-31b-it', mt: 500 },
   { name: 'requesty-nemotron', url: 'https://router.requesty.ai/v1/chat/completions', key: 'REQUESTY_API_KEY', model: 'nemotron-3-super-120b-a12b', mt: 500 },
@@ -40,14 +37,11 @@ const PROVIDERS = [
   { name: 'groq-oss-120b', url: 'https://api.groq.com/openai/v1/chat/completions', key: 'GROQ_API_KEY', model: 'openai/gpt-oss-120b', mt: 1200 },
   { name: 'groq-qwen', url: 'https://api.groq.com/openai/v1/chat/completions', key: 'GROQ_API_KEY', model: 'qwen/qwen3.8-27b', mt: 500 },
   { name: 'workers-ai', kind: 'cf-ai', key: 'CLOUDFLARE_AI_TOKEN', model: '@cf/meta/llama-3.1-8b-instruct', mt: 500 },
-  // Model ID below is the current best-known free multilingual chat model on
-  // OpenRouter; verify against the OpenRouter dashboard if replies look off.
   { name: 'openrouter', url: 'https://openrouter.ai/api/v1/chat/completions', key: 'OPENROUTER_API_KEY', model: 'meta-llama/llama-3.1-8b-instruct:free', mt: 500 },
   { name: 'gemini', url: 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', key: 'GEMINI_API_KEY', model: 'gemini-3.5-flash-lite', mt: 500 }
 ];
 const LAST_CHAT_PROVIDER = PROVIDERS[PROVIDERS.length - 1].name;
 
-// Search providers in fallback order; last entry is the last backup.
 const SEARCH_PROVIDERS = ['tavily', 'brave', 'exa'];
 const LAST_SEARCH_PROVIDER = SEARCH_PROVIDERS[SEARCH_PROVIDERS.length - 1];
 
@@ -77,7 +71,6 @@ function limited(ip) {
   return r.count > RATE_PER_HOUR;
 }
 
-// Per-isolate provider cooldowns (optimization; the KV budget is the real backstop).
 const cooldown = new Map();
 function inCooldown(name) {
   const until = cooldown.get(name);
@@ -87,7 +80,6 @@ function inCooldown(name) {
 }
 function setCooldown(name) { cooldown.set(name, Date.now() - 0 + PROVIDER_COOLDOWN_MS); }
 
-// ---- KV-backed global budgets + alert throttle (fail open without binding) ----
 function todayKey(kind) {
   return 'budget:' + kind + ':' + new Date().toISOString().slice(0, 10);
 }
@@ -170,7 +162,7 @@ function normFa(s) {
   return s.replace(/\u200c/g, '').replace(/ي/g, 'ی').replace(/ك/g, 'ک');
 }
 const SITE_Q = /calculator|ماشین.?حساب|newsletter|خبرنامه|signup|sign.?up|contact form|فرم تماس|knowledge center|first time buyer|seller tool|checklist|website|سایت|\btabs?\b/i;
-const MARKET_SIG = /price|rate|market|tax|rent|mortgage(?!\s*mortgage)|interest|inflation|housing|condo|buy|sell|purchase|\bboc\b|news|\b20\d\d\b|قیمت|نرخ|بازار|مالیات|بهره|وام|تورم|مسکن|خرید|فروش|ब्याज|कीमत|बाज़ार|महंगाई|आवास|खरीद|बिक्री|利率|房价|市场|新闻|房贷|通胀|购买|出售/i;
+const MARKET_SIG = /price|rate|market|tax|rent|mortgage(?!\s*calculator)|interest|inflation|housing|condo|buy|sell|purchase|\bboc\b|news|\b20\d\d\b|قیمت|نرخ|بازار|مالیات|بهره|وام|تورم|مسکن|خرید|فروش|ब्याज|कीमत|बाज़ार|महंगाई|आवास|खरीद|बिक्री|利率|房价|市场|新闻|房贷|通胀|购买|出售/i;
 function needsSearch(text) {
   const t = normFa(text.trim());
   if (MARKET_SIG.test(t)) return true;
@@ -377,7 +369,7 @@ async function sendBackupAlert(env, info) {
   }
 }
 
-const PITCH_RE = /newsletter|خبرنامه|calculator|ماشین ?حساب|knowledge center|مرکز آموزش|contact form|فرم تماس|first time buyer|seller tool|न्यूज़लेटर|न्यूज़लेटर|समाचार ?पत्र|कैलकुलेटर|ज्ञान केंद्र|संपर्क फ़ॉर्म|通讯|电子报|月报|计算器|知识中心|联系表单/i;
+const PITCH_RE = /newsletter|خبرنامه|calculator|ماشین ?حساب|knowledge center|مرکز آموزش|contact form|فرم تماس|first time buyer|seller tool|नईوزلیٹر|न्यूज़लेटर|समाचार ?पत्र|कैलकुलेटर|ज्ञान केंद्र|संपर्क फ़ॉर्म|通讯|电子报|月报|计算器|知识中心|联系表单/i;
 
 export default {
   async fetch(request, env, ctx) {
