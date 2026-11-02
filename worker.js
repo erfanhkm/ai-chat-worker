@@ -2,6 +2,9 @@
 // Chat cascade: Groq (oss-120b -> llama-70b -> qwen3-32b -> oss-20b) -> Workers AI -> OpenRouter -> Gemini (last backup).
 // Search chain: Tavily -> Brave -> Exa (last backup).
 // Responses include `via` ONLY for probe requests (X-Chat-Probe header + PROBE_SECRET).
+// Portal brain (2026-11-01): POST /internal/brain — secret-authed task endpoint for the
+// advisor worker (extraction -> Groq fast first, writing -> Gemini first, paid-provider
+// slots via model hints + keys held only as this worker's secrets).
 // When the LAST backup answers (chat or search) or everything fails, a throttled
 // email alert is sent via Resend (needs RESEND_API_KEY; gracefully skipped when unset).
 //
@@ -228,6 +231,36 @@ async function budgetLeft(env, kind) {
     }
     return true;
   } catch (err) { return memBudgetLeft(kind); }
+}
+// ---- portal-brain served-call counter (2026-11-01) ----
+// Same coalesced pattern as the budgets: per-isolate pending deltas
+// flush to KV every 3 calls; reads add the local pending delta.
+// Approximate by design (like the budgets) — it is a usage display.
+const brainCountMem = { day: '', base: 0, pending: 0 };
+async function brainCountBump(env) {
+  const day = new Date().toISOString().slice(0, 10);
+  if (brainCountMem.day !== day) {
+    brainCountMem.day = day; brainCountMem.base = 0; brainCountMem.pending = 0;
+    if (env.STATE) { try { brainCountMem.base = parseInt(await env.STATE.get('brain:calls:' + day) || '0', 10) || 0; } catch (e) {} }
+  }
+  brainCountMem.pending++;
+  if (env.STATE && brainCountMem.pending >= 3) {
+    const pend = brainCountMem.pending; brainCountMem.pending = 0;
+    try {
+      const kv = parseInt(await env.STATE.get('brain:calls:' + day) || '0', 10) || 0;
+      const nb = Math.max(kv, brainCountMem.base) + pend;
+      await env.STATE.put('brain:calls:' + day, String(nb), { expirationTtl: 90000 });
+      brainCountMem.base = nb;
+    } catch (e) { brainCountMem.pending += pend; }
+  }
+}
+async function brainCountRead(env) {
+  const day = new Date().toISOString().slice(0, 10);
+  let kv = 0;
+  if (env.STATE) { try { kv = parseInt(await env.STATE.get('brain:calls:' + day) || '0', 10) || 0; } catch (e) {} }
+  const base = brainCountMem.day === day ? brainCountMem.base : 0;
+  const pend = brainCountMem.day === day ? brainCountMem.pending : 0;
+  return Math.max(kv, base) + pend;
 }
 const memAlert = new Map();
 function memThrottled(kind) {
@@ -765,7 +798,7 @@ export default {
             lastChat = await env.STATE.get('lastvia:chat', { type: 'json' });
           } catch (e) { kvOk = false; }
         }
-        return json({ ok: true, kv: kvOk, day: dayU, chat: { used: chatUsed, budget: DAILY_CHAT_BUDGET, left: Math.max(0, DAILY_CHAT_BUDGET - chatUsed) }, search: { used: searchUsed, budget: DAILY_SEARCH_BUDGET, left: Math.max(0, DAILY_SEARCH_BUDGET - searchUsed) }, lastChat: lastChat, note: 'Counters flush to KV every 3 requests per isolate; used can lag by a few.' }, 200, origin);
+        return json({ ok: true, kv: kvOk, day: dayU, chat: { used: chatUsed, budget: DAILY_CHAT_BUDGET, left: Math.max(0, DAILY_CHAT_BUDGET - chatUsed) }, search: { used: searchUsed, budget: DAILY_SEARCH_BUDGET, left: Math.max(0, DAILY_SEARCH_BUDGET - searchUsed) }, brain: { used: await brainCountRead(env) }, lastChat: lastChat, note: 'Counters flush to KV every 3 requests per isolate; used can lag by a few.' }, 200, origin);
       }
       if (urlPath === '/api/internal/brief' || urlPath === '/api/internal/extract') {
         const sec = request.headers.get('X-Brief-Secret') || '';
@@ -809,6 +842,82 @@ export default {
         if (isBrief) return json({ ok: true, summary: sCap(parsed.summary, 1000), draft: sCap(parsed.draft, 2000), talkingPoints: (Array.isArray(parsed.talkingPoints) ? parsed.talkingPoints : []).map(function (tp) { return sCap(tp, 300); }).filter(Boolean).slice(0, 6) }, 200, origin);
         const stageN = String(parsed.suggestedStage == null ? '' : parsed.suggestedStage).trim().toLowerCase();
         return json({ ok: true, extracted: { summary: sCap(parsed.summary, 300), budget: sCap(parsed.budget, 200), areas: sCap(parsed.areas, 200), timeline: sCap(parsed.timeline, 200), preApproved: (parsed.preApproved === true || parsed.preApproved === false) ? parsed.preApproved : null, mustHaves: sCap(parsed.mustHaves, 200), objections: sCap(parsed.objections, 200), suggestedStage: ['new', 'contacted', 'viewing', 'offer', 'closed'].indexOf(stageN) !== -1 ? stageN : '', tasks: (Array.isArray(parsed.tasks) ? parsed.tasks : []).filter(function (t) { return t && (typeof t.text === 'string' || typeof t.text === 'number') && String(t.text).trim(); }).slice(0, 3).map(function (t) { const dv = t.dueInDays == null ? NaN : Math.round(Number(t.dueInDays)); return { text: String(t.text).trim().slice(0, 200), dueInDays: Number.isFinite(dv) ? Math.min(90, Math.max(0, dv)) : 2 }; }) } }, 200, origin);
+      }
+      // ---- internal portal-brain endpoint (2026-11-01) ----
+      // Server-to-server only (the advisor worker, via its AICHAT
+      // service binding), same X-Brief-Secret + PROBE_SECRET check as
+      // the CRM endpoints above. Runs the CHAT cascade (never search)
+      // with task-based routing: extraction/classification -> Groq fast
+      // models first; writing/drafts/briefs -> Gemini first; the
+      // standard cascade order is the fallback either way. Paid slots:
+      // the caller may pass model HINTS in data.paid
+      // ({claude|grok|perplexity: model-string}) — never keys. Keys live
+      // only here as worker secrets (ANTHROPIC_API_KEY / XAI_API_KEY /
+      // PERPLEXITY_API_KEY); when a hint and its key are both present
+      // the provider is prepended for writing tasks (Claude preferred).
+      // Absent -> skipped silently.
+      if (urlPath === '/internal/brain') {
+        const secB = request.headers.get('X-Brief-Secret') || '';
+        if (!(await secretOk(secB, env.PROBE_SECRET))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
+        const taskB = typeof data.task === 'string' ? data.task.slice(0, 40) : 'chat';
+        const sysB = typeof data.system === 'string' ? data.system.slice(0, 3000) : '';
+        let msgsB = [];
+        if (Array.isArray(data.messages)) {
+          msgsB = data.messages.slice(0, 8).filter(function (m) { return m && typeof m.content === 'string' && m.content.trim(); })
+            .map(function (m) { return { role: m.role === 'assistant' ? 'assistant' : 'user', content: redactPii(m.content.slice(0, 2500)) }; });
+        }
+        if (!msgsB.length && typeof data.prompt === 'string' && data.prompt.trim()) msgsB = [{ role: 'user', content: redactPii(data.prompt.slice(0, 6000)) }];
+        let totalB = 0; for (const mB of msgsB) totalB += mB.content.length;
+        if (!msgsB.length || totalB > 11000) return json({ ok: false, error: 'validation' }, 400, origin); // validate before charging the budget (same discipline as M7)
+        if (!(await budgetLeft(env, 'chat'))) return json({ ok: false, error: 'budget' }, 503, origin);
+        const mtB = Math.max(64, Math.min(2000, parseInt(data.maxTokens, 10) || 800));
+        const byNameB = {}; for (const pB of PROVIDERS) byNameB[pB.name] = pB;
+        const EXTRACT_ORDER = ['groq-oss-20b', 'groq-qwen', 'groq-oss-120b', 'groq-llama-70b', 'workers-ai', 'openrouter', 'gemini'];
+        const WRITE_ORDER = ['gemini', 'groq-oss-120b', 'groq-llama-70b', 'workers-ai', 'openrouter', 'groq-qwen', 'groq-oss-20b'];
+        const isExtractB = ['extract', 'classify', 'triage', 'intent'].indexOf(taskB) !== -1;
+        const chainB = [];
+        const paidB = (data.paid && typeof data.paid === 'object' && !Array.isArray(data.paid)) ? data.paid : {};
+        if (!isExtractB) {
+          if (typeof paidB.claude === 'string' && paidB.claude && env.ANTHROPIC_API_KEY) chainB.push({ name: 'claude', kind: 'anthropic', key: 'ANTHROPIC_API_KEY', model: String(paidB.claude).slice(0, 80), mt: mtB });
+          if (typeof paidB.grok === 'string' && paidB.grok && env.XAI_API_KEY) chainB.push({ name: 'grok', url: 'https://api.x.ai/v1/chat/completions', key: 'XAI_API_KEY', model: String(paidB.grok).slice(0, 80), mt: mtB });
+          if (typeof paidB.perplexity === 'string' && paidB.perplexity && env.PERPLEXITY_API_KEY) chainB.push({ name: 'perplexity', url: 'https://api.perplexity.ai/chat/completions', key: 'PERPLEXITY_API_KEY', model: String(paidB.perplexity).slice(0, 80), mt: mtB });
+        }
+        const orderB = isExtractB ? EXTRACT_ORDER : WRITE_ORDER;
+        for (const nmB of orderB) { const p0B = byNameB[nmB]; if (p0B) chainB.push(Object.assign({}, p0B, { mt: mtB })); }
+        let viaB = null, textB = '';
+        const t0b = Date.now();
+        for (const provB of chainB) {
+          if (Date.now() - t0b > TOTAL_DEADLINE_MS) break;
+          if (inCooldown(provB.name)) continue;
+          let outB = null;
+          if (provB.kind === 'anthropic') {
+            try {
+              const resA = await fetch('https://api.anthropic.com/v1/messages', {
+                method: 'POST',
+                headers: { 'x-api-key': env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01', 'Content-Type': 'application/json' },
+                body: JSON.stringify({ model: provB.model, max_tokens: mtB, system: sysB || undefined, messages: msgsB }),
+                signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
+              });
+              if (!resA.ok) { if (resA.status === 401 || resA.status === 403 || resA.status === 404 || resA.status === 429 || resA.status >= 500) setCooldown('claude'); }
+              else {
+                const aj = await resA.json().catch(function () { return null; });
+                const partsA = (aj && Array.isArray(aj.content)) ? aj.content.filter(function (c) { return c && c.type === 'text' && typeof c.text === 'string'; }).map(function (c) { return c.text; }) : [];
+                const txA = stripThink(partsA.join('\n'));
+                if (txA) outB = { ok: true, text: txA };
+              }
+            } catch (e) { setCooldown('claude'); }
+          } else {
+            outB = await callChat(env, provB, sysB, msgsB);
+          }
+          if (outB && outB.ok && outB.text) { viaB = provB.name; textB = outB.text; break; }
+        }
+        if (!viaB) {
+          try { ctx.waitUntil(sendBackupAlert(env, { chatVia: null, searchVia: null, down: true })); } catch (e) {}
+          return json({ ok: false, error: 'ai' }, 502, origin);
+        }
+        if (viaB === LAST_CHAT_PROVIDER) { try { ctx.waitUntil(sendBackupAlert(env, { chatVia: viaB, searchVia: null, chatViaLast: true })); } catch (e) {} }
+        await brainCountBump(env);
+        return json({ ok: true, text: String(textB).slice(0, 12000), via: viaB, task: taskB }, 200, origin);
       }
       let message = typeof data.message === 'string' ? data.message.trim().slice(0, MAX_MSG_LEN) : '';
       if (message) message = redactPii(wellForm(message)); // identifiers never reach the LLM providers or the search engines (cycle 32, Claude M3)
