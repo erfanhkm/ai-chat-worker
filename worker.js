@@ -762,13 +762,15 @@ export default {
     if (request.method === 'OPTIONS') return new Response(null, { headers: cors(origin) });
     try {
       if (request.method !== 'POST') return json({ ok: false, error: 'method' }, 405, origin);
+      const capPath = new URL(request.url).pathname;
+      const capBytes = capPath === '/internal/brain-audio' ? 12000000 : MAX_BODY_BYTES;
       const clen = parseInt(request.headers.get('Content-Length') || '0', 10);
-      if (clen > MAX_BODY_BYTES) return json({ ok: false, error: 'too_large' }, 413, origin);
+      if (clen > capBytes) return json({ ok: false, error: 'too_large' }, 413, origin);
       const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
       if (limited(ip)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
       let data = null;
       try {
-        const rawBody = await readCapped(request, MAX_BODY_BYTES);
+        const rawBody = await readCapped(request, capBytes);
         if (rawBody === null) return json({ ok: false, error: 'too_large' }, 413, origin);
         data = JSON.parse(rawBody);
       } catch (e) {}
@@ -871,6 +873,27 @@ export default {
         if (!msgsB.length || totalB > 11000) return json({ ok: false, error: 'validation' }, 400, origin); // validate before charging the budget (same discipline as M7)
         if (!(await budgetLeft(env, 'chat'))) return json({ ok: false, error: 'budget' }, 503, origin);
         const mtB = Math.max(64, Math.min(2000, parseInt(data.maxTokens, 10) || 800));
+        // Portal Brain 2 — WEB EYES: the caller may attach a research
+        // query; the existing search chain (Tavily->Brave->Exa, 10-min
+        // cache, shared daily search budget) runs ONCE and its results
+        // are appended to the final user message as a dated, numbered
+        // context block. The response carries the source list so the
+        // caller can show citations. Failure/empty/budget-out degrade
+        // to internal-data-only with an explicit note — never an error.
+        let researchSources = null, researchNote = '';
+        if (data.research && typeof data.research === 'object' && typeof data.research.query === 'string' && data.research.query.trim()) {
+          const rq = data.research.query.slice(0, 200);
+          let sr = null;
+          try {
+            if (cacheGet(normKey(rq)) || (await budgetLeft(env, 'search'))) sr = await liveSearch(env, rq);
+          } catch (e) { sr = null; }
+          if (sr && sr.results && sr.results.length) {
+            researchSources = sr.results.slice(0, 5).map(function (x) { return { title: String(x.title || '').slice(0, 200), url: String(x.url || '').slice(0, 300) }; });
+            const block = '\n\nWEB RESEARCH (retrieved ' + new Date().toISOString().slice(0, 10) + ' via ' + (sr.via || 'search') + (sr.cached ? ', cached' : '') + ') — cite claims from it as [1], [2] etc. matching these numbers; anything in neither these results nor the provided data must NOT be stated as fact:\n' + sr.results.slice(0, 5).map(function (x, i) { return '[' + (i + 1) + '] ' + String(x.title || '') + ' — ' + String(x.snippet || '').slice(0, 400) + ' (' + String(x.url || '') + ')'; }).join('\n');
+            const liB = msgsB.length - 1;
+            msgsB[liB] = { role: msgsB[liB].role, content: (msgsB[liB].content + block).slice(0, 10000) };
+          } else { researchNote = 'Web research unavailable for this task (no results, search error, or daily search budget reached); internal data only.'; }
+        }
         const byNameB = {}; for (const pB of PROVIDERS) byNameB[pB.name] = pB;
         const EXTRACT_ORDER = ['groq-oss-20b', 'groq-qwen', 'groq-oss-120b', 'groq-llama-70b', 'workers-ai', 'openrouter', 'gemini'];
         const WRITE_ORDER = ['gemini', 'groq-oss-120b', 'groq-llama-70b', 'workers-ai', 'openrouter', 'groq-qwen', 'groq-oss-20b'];
@@ -882,7 +905,11 @@ export default {
           if (typeof paidB.grok === 'string' && paidB.grok && env.XAI_API_KEY) chainB.push({ name: 'grok', url: 'https://api.x.ai/v1/chat/completions', key: 'XAI_API_KEY', model: String(paidB.grok).slice(0, 80), mt: mtB });
           if (typeof paidB.perplexity === 'string' && paidB.perplexity && env.PERPLEXITY_API_KEY) chainB.push({ name: 'perplexity', url: 'https://api.perplexity.ai/chat/completions', key: 'PERPLEXITY_API_KEY', model: String(paidB.perplexity).slice(0, 80), mt: mtB });
         }
-        const orderB = isExtractB ? EXTRACT_ORDER : WRITE_ORDER;
+        // Critic tasks route to a DIFFERENT first provider family than
+        // the writing order (Gemini-first) so the second opinion is not
+        // the writer grading its own homework when avoidable.
+        const CRITIC_ORDER = ['groq-oss-120b', 'workers-ai', 'openrouter', 'groq-llama-70b', 'gemini', 'groq-qwen', 'groq-oss-20b'];
+        const orderB = taskB === 'critic' ? CRITIC_ORDER : (isExtractB ? EXTRACT_ORDER : WRITE_ORDER);
         for (const nmB of orderB) { const p0B = byNameB[nmB]; if (p0B) chainB.push(Object.assign({}, p0B, { mt: mtB })); }
         let viaB = null, textB = '';
         const t0b = Date.now();
@@ -917,7 +944,67 @@ export default {
         }
         if (viaB === LAST_CHAT_PROVIDER) { try { ctx.waitUntil(sendBackupAlert(env, { chatVia: viaB, searchVia: null, chatViaLast: true })); } catch (e) {} }
         await brainCountBump(env);
-        return json({ ok: true, text: String(textB).slice(0, 12000), via: viaB, task: taskB }, 200, origin);
+        return json({ ok: true, text: String(textB).slice(0, 12000), via: viaB, task: taskB, sources: researchSources, researchNote: researchNote }, 200, origin);
+      }
+      // ---- internal voice transcription (Portal Brain 2) ----
+      // Groq Whisper (whisper-large-v3, free tier). Audio arrives as
+      // base64 in the JSON body, is forwarded as multipart form data,
+      // and is NEVER stored — only the transcript returns. fa first
+      // (Erfan's memos), EN fallback when fa yields nothing.
+      if (urlPath === '/internal/brain-audio') {
+        const secAu = request.headers.get('X-Brief-Secret') || '';
+        if (!(await secretOk(secAu, env.PROBE_SECRET))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
+        const b64A = typeof data.audioBase64 === 'string' ? data.audioBase64.replace(/\s/g, '') : '';
+        if (!b64A || b64A.length > 11000000) return json({ ok: false, error: 'validation' }, 400, origin);
+        if (!env.GROQ_API_KEY) return json({ ok: false, error: 'unconfigured' }, 503, origin);
+        if (!(await budgetLeft(env, 'chat'))) return json({ ok: false, error: 'budget' }, 503, origin);
+        let binA = null;
+        try { binA = atob(b64A); } catch (e) { return json({ ok: false, error: 'validation' }, 400, origin); }
+        const bytesA = new Uint8Array(binA.length);
+        for (let iA = 0; iA < binA.length; iA++) bytesA[iA] = binA.charCodeAt(iA);
+        const mimeA = typeof data.mime === 'string' ? data.mime.slice(0, 60) : 'audio/webm';
+        const tryWhisper = async function (lgA) {
+          const fdA = new FormData();
+          fdA.append('file', new Blob([bytesA], { type: mimeA }), 'memo.webm');
+          fdA.append('model', 'whisper-large-v3');
+          if (lgA) fdA.append('language', lgA);
+          fdA.append('response_format', 'json');
+          const resW = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', { method: 'POST', headers: { 'Authorization': 'Bearer ' + env.GROQ_API_KEY }, body: fdA, signal: AbortSignal.timeout(30000) });
+          if (!resW.ok) return { ok: false, status: resW.status };
+          const jW = await resW.json().catch(function () { return null; });
+          return { ok: !!(jW && typeof jW.text === 'string' && jW.text.trim()), text: (jW && jW.text) || '' };
+        };
+        let outAu = null;
+        try { outAu = await tryWhisper(data.lang === 'en' ? 'en' : 'fa'); if (!outAu.ok && data.lang !== 'en') outAu = await tryWhisper('en'); } catch (e) { outAu = { ok: false }; }
+        if (!outAu || !outAu.ok) return json({ ok: false, error: 'transcribe_failed' }, 502, origin);
+        await brainCountBump(env);
+        return json({ ok: true, text: String(outAu.text).slice(0, 4000) }, 200, origin);
+      }
+      // ---- internal site-chat transcript summary (Portal Brain 2) ----
+      // The advisor asks for a summary of a stored chat transcript when
+      // a visitor who chatted becomes a lead. Only the transcript goes
+      // to the provider; no transcript -> summary:null (never invented).
+      if (urlPath === '/internal/chat-summary') {
+        const secCs = request.headers.get('X-Brief-Secret') || '';
+        if (!(await secretOk(secCs, env.PROBE_SECRET))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
+        const sidCs = typeof data.sessionId === 'string' ? data.sessionId : '';
+        if (!/^[A-Za-z0-9_-]{8,64}$/.test(sidCs)) return json({ ok: false, error: 'validation' }, 400, origin);
+        let txCs = null;
+        if (env.STATE) { try { txCs = JSON.parse(await env.STATE.get('chat:tx:' + sidCs) || 'null'); } catch (e) {} }
+        if (!Array.isArray(txCs) || !txCs.length) return json({ ok: true, summary: null }, 200, origin);
+        if (!(await budgetLeft(env, 'chat'))) return json({ ok: false, error: 'budget' }, 503, origin);
+        const convoCs = txCs.map(function (m) { return (m.r === 'a' ? 'Assistant: ' : 'Visitor: ') + String(m.t || '').slice(0, 800); }).join('\n').slice(0, 7000);
+        const sysCs = 'Summarise this website chat transcript in 2-3 short sentences for the real-estate advisor: what the visitor wants, areas/budget/timeline mentioned, and anything they asked to be contacted about. Use ONLY the transcript. Reply with the summary text only, no preamble.';
+        const byNameCs = {}; for (const pCs of PROVIDERS) byNameCs[pCs.name] = pCs;
+        let sumCs = '';
+        for (const nmCs of ['groq-oss-20b', 'groq-qwen', 'groq-oss-120b', 'workers-ai', 'gemini']) {
+          const pCs = byNameCs[nmCs]; if (!pCs || inCooldown(pCs.name)) continue;
+          const oCs = await callChat(env, Object.assign({}, pCs, { mt: 300 }), sysCs, [{ role: 'user', content: convoCs }]);
+          if (oCs && oCs.ok && oCs.text) { sumCs = oCs.text; break; }
+        }
+        if (!sumCs) return json({ ok: false, error: 'ai' }, 502, origin);
+        await brainCountBump(env);
+        return json({ ok: true, summary: String(sumCs).slice(0, 600) }, 200, origin);
       }
       let message = typeof data.message === 'string' ? data.message.trim().slice(0, MAX_MSG_LEN) : '';
       if (message) message = redactPii(wellForm(message)); // identifiers never reach the LLM providers or the search engines (cycle 32, Claude M3)
@@ -1066,6 +1153,23 @@ export default {
       if (down) return json({ ok: false, error: 'ai' }, 502, origin);
       const sources = (searchResults || []).slice(0, 3).map(r => ({ title: r.title, url: r.url }));
       const showVia = env.PROBE_SECRET ? await secretOk(request.headers.get('X-Chat-Probe') || '', env.PROBE_SECRET) : false;
+      // Site-chat bridge (Portal Brain 2): retain a bounded transcript
+      // keyed by the widget's session id (STATE KV, 30-day TTL). The
+      // stored visitor text is the already-PII-redacted message, so no
+      // raw identifiers are kept; the advisor summarises it at lead
+      // time via /internal/chat-summary.
+      try {
+        const sidT = typeof data.sessionId === 'string' ? data.sessionId : '';
+        if (env.STATE && /^[A-Za-z0-9_-]{8,64}$/.test(sidT) && ctx && ctx.waitUntil) {
+          ctx.waitUntil((async function () {
+            try {
+              let txT = null; try { txT = JSON.parse(await env.STATE.get('chat:tx:' + sidT) || 'null'); } catch (e) {}
+              const arrT = (Array.isArray(txT) ? txT : []).concat([{ r: 'u', t: String(message).slice(0, 800) }, { r: 'a', t: String(replyText).slice(0, 800) }]).slice(-20);
+              await env.STATE.put('chat:tx:' + sidT, JSON.stringify(arrT), { expirationTtl: 2592000 });
+            } catch (e) {}
+          })());
+        }
+      } catch (e) {}
       const out = { ok: true, reply: replyText, sources: sources };
       if (showVia) out.via = chatVia;
       return json(out, 200, origin);
