@@ -174,6 +174,20 @@ function limited(ip) {
   return r.count > RATE_PER_HOUR;
 }
 
+// Timing-safe secret comparison (SHA-256 digests + constant-time compare).
+// Top-level twin of the handler-local secretOk: the rate-limiter probe
+// exemption below runs BEFORE that local helper is defined in the handler.
+async function secretEq(got, want) {
+  if (!want || !got) return false;
+  const enc = new TextEncoder();
+  const pair = await Promise.all([crypto.subtle.digest('SHA-256', enc.encode(String(got))), crypto.subtle.digest('SHA-256', enc.encode(String(want)))]);
+  if (typeof crypto.subtle.timingSafeEqual === 'function') return crypto.subtle.timingSafeEqual(pair[0], pair[1]);
+  const ba = new Uint8Array(pair[0]), bb = new Uint8Array(pair[1]);
+  let diff = 0;
+  for (let i = 0; i < ba.length; i++) diff |= ba[i] ^ bb[i];
+  return diff === 0;
+}
+
 // Per-isolate provider cooldowns (optimization; the KV budget is the real backstop).
 const cooldown = new Map();
 function inCooldown(name) {
@@ -767,7 +781,15 @@ export default {
       const clen = parseInt(request.headers.get('Content-Length') || '0', 10);
       if (clen > capBytes) return json({ ok: false, error: 'too_large' }, 413, origin);
       const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
-      if (limited(ip)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
+      // Probe exemption (2026-11-02): the hourly health probe shares this
+      // VM's egress-IP bucket and kept tripping the per-IP limiter, which
+      // produced false "backend down" alerts while the backend was healthy.
+      // A request whose X-Chat-Probe header matches PROBE_SECRET (the same
+      // secret the internal endpoints verify) skips the limiter only; it
+      // still costs budget and still gets its `via` field. Fail closed:
+      // no PROBE_SECRET configured -> no exemption for anyone.
+      const probeExempt = env.PROBE_SECRET ? await secretEq(request.headers.get('X-Chat-Probe') || '', env.PROBE_SECRET) : false;
+      if (!probeExempt && limited(ip)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
       let data = null;
       try {
         const rawBody = await readCapped(request, capBytes);
