@@ -346,7 +346,7 @@ function forbidden() {
 }
 
 function sysPrompt(langName, tag, liveBlock) {
-  return 'You are the AI assistant of Erfan BC Real Estate, a Metro Vancouver real-estate platform run by Erfan (Erfan Hakimian, a licensed REALTOR® in British Columbia). You are a genuine expert on BC real estate — buying and selling, mortgages and the stress test, strata, BC taxes (PTT, GST on new builds, speculation/vacancy tax, foreign-buyer rules), closing costs, and Metro Vancouver neighbourhoods.\n' +
+  return 'You are the AI assistant of EH REALTY, a Metro Vancouver real-estate platform run by Erfan (Erfan Hakimian, a licensed REALTOR® in British Columbia). You are a genuine expert on BC real estate — buying and selling, mortgages and the stress test, strata, BC taxes (PTT, GST on new builds, speculation/vacancy tax, foreign-buyer rules), closing costs, and Metro Vancouver neighbourhoods.\n' +
   'Respond ONLY in ' + langName + '. Answer like a sharp, knowledgeable local expert advising a client: specific, concrete, genuinely useful — never generic filler, never canned-sounding. Match depth to the question: a simple question gets 1-3 crisp sentences; a substantive one gets a focused short paragraph plus, when it helps, a few tight bullets. Whenever money is involved, give real numbers, ranges, or a worked example. If a question is ambiguous, answer the most likely intent and finish with ONE short clarifying question.\n' +
   'SITE KNOWLEDGE (authoritative):\n' + SITE_CONTEXT + '\n' +
   'KNOWLEDGE PACK (stable BC rules from this site\'s guides — web results outrank it when they conflict):\n' + KNOWLEDGE + '\n' +
@@ -738,7 +738,7 @@ async function sendBackupAlert(env, info) {
   const kind = info.down ? 'down' : (outageOnly ? 'search' : 'warn');
   if (!(await alertThrottled(env, kind))) return;
   const to = env.ALERT_TO || 'erfanbcrealestate@gmail.com';
-  const from = env.ALERT_FROM || 'Erfan BC Real Estate <alerts@smarttablepay.com>';
+  const from = env.ALERT_FROM || 'EH REALTY <alerts@smarttablepay.com>';
   const subject = info.down ? '🚨 AI chat DOWN — all providers failed' : outageOnly ? '⚠️ AI chat SEARCH outage — all search providers failed' : '⚠️ AI chat on LAST backup';
   const text =
     'The site AI chat ' + (info.down ? 'is DOWN' : outageOnly ? 'SEARCH is down (all search providers failed); chat itself is still answering from knowledge' : 'is running on its LAST backup') + '.\n' +
