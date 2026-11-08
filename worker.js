@@ -28,6 +28,14 @@ const PROVIDER_COOLDOWN_MS = 3 * 60 * 1000;
 const CF_ACCOUNT_ID_DEFAULT = '216209568308b78b6b59c701b4da03f1';
 const DAILY_CHAT_BUDGET = 700;
 const DAILY_SEARCH_BUDGET = 150;
+/* Pack PM6 (gap #28): the internal brain family (portal brain,
+   brief/extract, voice, chat-summary) has its OWN daily budget. It
+   used to draw on the public chat's 700/day, so a busy visitor day
+   could starve the advisor's portal brain — and a heavy brain day
+   could eat the public chat's budget. The advisor worker's own
+   brain cap (default 300/day) still binds first for /internal/brain
+   traffic; this 500 ceiling covers the whole internal family. */
+const DAILY_BRAIN_BUDGET = 500;
 
 // NOTE: 'null' deliberately NOT allowlisted (sandboxed iframes/data: URLs send
 // Origin: null). POST requires an allowlisted Origin; the hourly probe sends one.
@@ -203,9 +211,10 @@ function todayKey(kind) {
   return 'budget:' + kind + ':' + new Date().toISOString().slice(0, 10);
 }
 const memBudget = new Map();
+function budgetLimit(kind) { return kind === 'chat' ? DAILY_CHAT_BUDGET : (kind === 'search' ? DAILY_SEARCH_BUDGET : DAILY_BRAIN_BUDGET); }
 function memBudgetLeft(kind) {
   const k = todayKey(kind);
-  const limit = kind === 'chat' ? DAILY_CHAT_BUDGET : DAILY_SEARCH_BUDGET;
+  const limit = budgetLimit(kind);
   const cur = memBudget.get(k) || 0;
   if (cur >= limit) return false;
   memBudget.set(k, cur + 1);
@@ -223,7 +232,7 @@ let lastViaMem = '';
 async function budgetLeft(env, kind) {
   if (!env.STATE) return memBudgetLeft(kind);
   try {
-    const limit = kind === 'chat' ? DAILY_CHAT_BUDGET : DAILY_SEARCH_BUDGET;
+    const limit = budgetLimit(kind);
     const day = new Date().toISOString().slice(0, 10);
     let e = kvBudget.get(kind);
     if (!e || e.day !== day) {
@@ -814,15 +823,16 @@ export default {
         const secU = request.headers.get('X-Brief-Secret') || '';
         if (!(await secretOk(secU, env.PROBE_SECRET))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
         const dayU = new Date().toISOString().slice(0, 10);
-        let chatUsed = 0, searchUsed = 0, lastChat = null, kvOk = !!env.STATE;
+        let chatUsed = 0, searchUsed = 0, brainBudgetUsed = 0, lastChat = null, kvOk = !!env.STATE;
         if (env.STATE) {
           try {
             chatUsed = parseInt(await env.STATE.get('budget:chat:' + dayU) || '0', 10) || 0;
             searchUsed = parseInt(await env.STATE.get('budget:search:' + dayU) || '0', 10) || 0;
+            brainBudgetUsed = parseInt(await env.STATE.get('budget:brain:' + dayU) || '0', 10) || 0;
             lastChat = await env.STATE.get('lastvia:chat', { type: 'json' });
           } catch (e) { kvOk = false; }
         }
-        return json({ ok: true, kv: kvOk, day: dayU, chat: { used: chatUsed, budget: DAILY_CHAT_BUDGET, left: Math.max(0, DAILY_CHAT_BUDGET - chatUsed) }, search: { used: searchUsed, budget: DAILY_SEARCH_BUDGET, left: Math.max(0, DAILY_SEARCH_BUDGET - searchUsed) }, brain: { used: await brainCountRead(env) }, lastChat: lastChat, note: 'Counters flush to KV every 3 requests per isolate; used can lag by a few.' }, 200, origin);
+        return json({ ok: true, kv: kvOk, day: dayU, chat: { used: chatUsed, budget: DAILY_CHAT_BUDGET, left: Math.max(0, DAILY_CHAT_BUDGET - chatUsed) }, search: { used: searchUsed, budget: DAILY_SEARCH_BUDGET, left: Math.max(0, DAILY_SEARCH_BUDGET - searchUsed) }, brain: { used: await brainCountRead(env), budgetUsed: brainBudgetUsed, budget: DAILY_BRAIN_BUDGET, left: Math.max(0, DAILY_BRAIN_BUDGET - brainBudgetUsed) }, lastChat: lastChat, note: 'Counters flush to KV every 3 requests per isolate; used can lag by a few.' }, 200, origin);
       }
       if (urlPath === '/api/internal/brief' || urlPath === '/api/internal/extract') {
         const sec = request.headers.get('X-Brief-Secret') || '';
@@ -833,7 +843,7 @@ export default {
         const contactForAi = Object.assign({}, contact);
         delete contactForAi.email; delete contactForAi.phone;
         if (isBrief && !Object.keys(contactForAi).length) return json({ ok: false, error: 'validation' }, 400, origin); // never ask the model to summarize nothing (cycle 32, Claude M9)
-        if (!(await budgetLeft(env, 'chat'))) return json({ ok: false, error: 'budget' }, 503, origin);
+        if (!(await budgetLeft(env, 'brain'))) return json({ ok: false, error: 'budget' }, 503, origin); // Pack PM6: internal family draws on the brain sub-budget, not the public chat's
         const mode = ['brief', 'draft', 'meeting'].includes(data.mode) ? data.mode : 'brief';
         const vanToday = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Vancouver' });
         const dtagBytes = new Uint8Array(4); crypto.getRandomValues(dtagBytes);
@@ -893,7 +903,7 @@ export default {
         if (!msgsB.length && typeof data.prompt === 'string' && data.prompt.trim()) msgsB = [{ role: 'user', content: redactPii(data.prompt.slice(0, 6000)) }];
         let totalB = 0; for (const mB of msgsB) totalB += mB.content.length;
         if (!msgsB.length || totalB > 11000) return json({ ok: false, error: 'validation' }, 400, origin); // validate before charging the budget (same discipline as M7)
-        if (!(await budgetLeft(env, 'chat'))) return json({ ok: false, error: 'budget' }, 503, origin);
+        if (!(await budgetLeft(env, 'brain'))) return json({ ok: false, error: 'budget' }, 503, origin); // Pack PM6: brain sub-budget (see DAILY_BRAIN_BUDGET)
         const mtB = Math.max(64, Math.min(2000, parseInt(data.maxTokens, 10) || 800));
         // Portal Brain 2 — WEB EYES: the caller may attach a research
         // query; the existing search chain (Tavily->Brave->Exa, 10-min
@@ -990,7 +1000,7 @@ export default {
         const b64A = typeof data.audioBase64 === 'string' ? data.audioBase64.replace(/\s/g, '') : '';
         if (!b64A || b64A.length > 11000000) return json({ ok: false, error: 'validation' }, 400, origin);
         if (!env.GROQ_API_KEY) return json({ ok: false, error: 'unconfigured' }, 503, origin);
-        if (!(await budgetLeft(env, 'chat'))) return json({ ok: false, error: 'budget' }, 503, origin);
+        if (!(await budgetLeft(env, 'brain'))) return json({ ok: false, error: 'budget' }, 503, origin); // Pack PM6: brain sub-budget
         let binA = null;
         try { binA = atob(b64A); } catch (e) { return json({ ok: false, error: 'validation' }, 400, origin); }
         const bytesA = new Uint8Array(binA.length);
@@ -1030,7 +1040,7 @@ export default {
         let txCs = null;
         if (env.STATE) { try { txCs = JSON.parse(await env.STATE.get('chat:tx:' + sidCs) || 'null'); } catch (e) {} }
         if (!Array.isArray(txCs) || !txCs.length) return json({ ok: true, summary: null }, 200, origin);
-        if (!(await budgetLeft(env, 'chat'))) return json({ ok: false, error: 'budget' }, 503, origin);
+        if (!(await budgetLeft(env, 'brain'))) return json({ ok: false, error: 'budget' }, 503, origin); // Pack PM6: brain sub-budget
         const convoCs = txCs.map(function (m) { return (m.r === 'a' ? 'Assistant: ' : 'Visitor: ') + String(m.t || '').slice(0, 800); }).join('\n').slice(0, 7000);
         const sysCs = 'Summarise this website chat transcript in 2-3 short sentences for the real-estate advisor: what the visitor wants, areas/budget/timeline mentioned, and anything they asked to be contacted about. Use ONLY the transcript. Reply with the summary text only, no preamble.';
         const byNameCs = {}; for (const pCs of PROVIDERS) byNameCs[pCs.name] = pCs;
