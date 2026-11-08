@@ -1025,9 +1025,24 @@ export default {
         const bytesA = new Uint8Array(binA.length);
         for (let iA = 0; iA < binA.length; iA++) bytesA[iA] = binA.charCodeAt(iA);
         const mimeA = typeof data.mime === 'string' ? data.mime.slice(0, 60) : 'audio/webm';
+        /* Pack PM9 (#31): the Whisper filename must tell the truth
+           about the container. iPhone Safari's MediaRecorder produces
+           audio/mp4 while desktop Chrome produces audio/webm — the
+           old hardcoded 'memo.webm' made filename, Blob type and
+           content disagree for every iPhone memo, and Groq can reject
+           or mis-decode on that mismatch. The extension now derives
+           from the client's real mime (codec parameters stripped);
+           mp4 maps to .m4a (same AAC container family Whisper lists). */
+        const mimeBareA = (mimeA.split(';')[0] || '').trim().toLowerCase() || 'audio/webm';
+        const extA = mimeBareA.includes('mp4') || mimeBareA.includes('m4a') || mimeBareA.includes('aac') ? 'm4a'
+          : mimeBareA.includes('ogg') ? 'ogg'
+          : mimeBareA.includes('wav') ? 'wav'
+          : mimeBareA.includes('flac') ? 'flac'
+          : mimeBareA.includes('mpeg') || mimeBareA.includes('mp3') ? 'mp3'
+          : 'webm';
         const tryWhisper = async function (lgA) {
           const fdA = new FormData();
-          fdA.append('file', new Blob([bytesA], { type: mimeA }), 'memo.webm');
+          fdA.append('file', new Blob([bytesA], { type: mimeBareA }), 'memo.' + extA);
           fdA.append('model', 'whisper-large-v3');
           if (lgA) fdA.append('language', lgA);
           fdA.append('response_format', 'json');
