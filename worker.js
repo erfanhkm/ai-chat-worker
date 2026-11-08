@@ -1006,6 +1006,11 @@ export default {
       // The advisor asks for a summary of a stored chat transcript when
       // a visitor who chatted becomes a lead. Only the transcript goes
       // to the provider; no transcript -> summary:null (never invented).
+      // PB2-08 §D (2026-11-07): secret-gated and read-only; since the
+      // chat handler no longer stores transcripts under unverified
+      // client sessionIds, no id this worker did not issue can reach a
+      // transcript here — every lookup returns summary:null until the
+      // signed bridge scheme (activation) starts storing again.
       if (urlPath === '/internal/chat-summary') {
         const secCs = request.headers.get('X-Brief-Secret') || '';
         if (!(await secretOk(secCs, env.PROBE_SECRET))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
@@ -1180,8 +1185,14 @@ export default {
       // stored visitor text is the already-PII-redacted message, so no
       // raw identifiers are kept; the advisor summarises it at lead
       // time via /internal/chat-summary.
+      // PB2-08 §D (2026-11-07): data.sessionId is client-supplied and
+      // UNVERIFIED — until the server-issued signed scheme exists
+      // (bridge activation, post-licensing) it is IGNORED here: sidT
+      // stays '' so the store below never runs and no transcript is
+      // ever keyed by an id this worker did not issue. The store code
+      // stays in place, ready for the signed scheme.
       try {
-        const sidT = typeof data.sessionId === 'string' ? data.sessionId : '';
+        const sidT = ''; // was: typeof data.sessionId === 'string' ? data.sessionId : ''
         if (env.STATE && /^[A-Za-z0-9_-]{8,64}$/.test(sidT) && ctx && ctx.waitUntil) {
           ctx.waitUntil((async function () {
             try {
