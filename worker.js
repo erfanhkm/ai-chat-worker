@@ -676,15 +676,28 @@ async function callOpenAICompatible(env, provider, sysText, messages) {
   const apiKey = env[provider.key];
   if (!apiKey) return { ok: false, skip: true };
   try {
+    const reqBody = {
+      model: provider.model,
+      messages: [{ role: 'system', content: sysText }].concat(messages),
+      max_tokens: provider.mt || 500,
+      temperature: 0.3 // factual accuracy over variety (cycle 32, Claude L5)
+    };
+    /* Pack PM8 (#14b): JSON mode — set ONLY on chain entries the
+       /internal/brain handler marked (data.jsonMode from the advisor,
+       which sets it solely for its structured JSON tasks). Groq,
+       OpenRouter and the Gemini OpenAI-compatible endpoint document
+       response_format json_object support; a provider that rejects
+       the parameter answers non-ok and the chain falls through to
+       the next entry exactly as for any other provider failure, and
+       the advisor's shape validation + repair retry is the floor.
+       The public chat never sets the flag (its entries come straight
+       from PROVIDERS) and Workers AI entries never carry it (the
+       cf-ai builder below has its own body shape). */
+    if (provider.jsonMode) reqBody.response_format = { type: 'json_object' };
     const res = await fetch(provider.url, {
       method: 'POST',
       headers: { 'Authorization': 'Bearer ' + apiKey, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: provider.model,
-        messages: [{ role: 'system', content: sysText }].concat(messages),
-        max_tokens: provider.mt || 500,
-        temperature: 0.3 // factual accuracy over variety (cycle 32, Claude L5)
-      }),
+      body: JSON.stringify(reqBody),
       signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
     });
     if (!res.ok) {
@@ -947,7 +960,13 @@ export default {
         // the writer grading its own homework when avoidable.
         const CRITIC_ORDER = ['groq-oss-120b', 'workers-ai', 'openrouter', 'groq-llama-70b', 'gemini', 'groq-qwen', 'groq-oss-20b'];
         const orderB = taskB === 'critic' ? CRITIC_ORDER : (isExtractB ? EXTRACT_ORDER : WRITE_ORDER);
-        for (const nmB of orderB) { const p0B = byNameB[nmB]; if (p0B) chainB.push(Object.assign({}, p0B, { mt: mtB })); }
+        /* Pack PM8 (#14b): JSON mode — the advisor sets data.jsonMode
+           only for its structured JSON tasks; mark the free-chain
+           entries (never the Anthropic paid entry, whose Messages API
+           has no response_format, and never cf-ai entries, whose
+           builder ignores the flag). */
+        const jsonModeB = data.jsonMode === true;
+        for (const nmB of orderB) { const p0B = byNameB[nmB]; if (p0B) chainB.push(Object.assign({}, p0B, { mt: mtB, jsonMode: jsonModeB && p0B.kind !== 'cf-ai' })); }
         /* Pack PM2 (PB2-03R S9): critic independence — when the caller
            names the writer's provider (data.avoid), the critic chain
            drops it (paid entries included), so the second opinion is
