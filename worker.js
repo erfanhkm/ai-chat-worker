@@ -41,6 +41,8 @@ const DAILY_BRAIN_BUDGET = 500;
 // Origin: null). POST requires an allowlisted Origin; the hourly probe sends one.
 const ALLOWED_ORIGINS = [
   'https://real-estate-platform-0aei.onrender.com',
+  'https://ehrealtybc.com',
+  'https://www.ehrealtybc.com',
   'https://muse.ai'
 ];
 
