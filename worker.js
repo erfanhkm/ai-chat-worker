@@ -911,6 +911,45 @@ async function sendBackupAlert(env, info) {
 }
 
 
+// ---- Pack DP12 (F-047): Turnstile verification for the PUBLIC chat ----
+// The client reuses the site's ONE existing Turnstile sitekey; this worker
+// verifies the token against siteverify with its OWN secret
+// (env.TURNSTILE_SECRET, provisioned at deploy time — the same widget
+// secret the advisor worker verifies form tokens against).
+// Verdicts: 'ok' (proceed), 'reject' (token missing/invalid — the caller
+// answers 429 captcha), 'fallback' (siteverify unreachable, misconfigured
+// or the secret not yet provisioned — the caller proceeds on the cap-only
+// posture and the fallback is logged LOUDLY: chat availability for
+// legitimate visitors must not die with a third-party outage or a
+// provisioning gap, and the caps/budgets remain the backstop meanwhile).
+const TS_HOSTS_CHAT = ['real-estate-platform-0aei.onrender.com', 'ehrealtybc.com', 'www.ehrealtybc.com', 'muse.ai'];
+const TS_TOKEN_ERRORS = ['missing-input-response', 'invalid-input-response', 'expired-input-response', 'already-redeemed', 'timeout-or-duplicate'];
+async function turnstileChat(env, token, ip) {
+  if (!env.TURNSTILE_SECRET) { console.log('[ai-chat] TURNSTILE FALLBACK: TURNSTILE_SECRET not configured — cap-only posture'); return 'fallback'; }
+  const tok = typeof token === 'string' ? token.slice(0, 2048) : '';
+  if (!tok) return 'reject';
+  try {
+    const r = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams(Object.assign({ secret: env.TURNSTILE_SECRET, response: tok }, ip ? { remoteip: ip } : {})),
+      signal: AbortSignal.timeout(8000)
+    });
+    const j = await r.json();
+    if (j && j.success) {
+      if (!j.hostname || TS_HOSTS_CHAT.indexOf(j.hostname) !== -1) return 'ok';
+      return 'reject'; // token minted for a different site
+    }
+    const errs = (j && Array.isArray(j['error-codes'])) ? j['error-codes'] : [];
+    if (errs.length && errs.every(function (e) { return TS_TOKEN_ERRORS.indexOf(e) !== -1; })) return 'reject';
+    if (errs.length) { console.log('[ai-chat] TURNSTILE FALLBACK: siteverify config-side error (' + errs.join(',') + ') — cap-only posture for this request'); return 'fallback'; }
+    return 'reject'; // success:false with no codes: a token verdict, fail closed
+  } catch (e) {
+    console.log('[ai-chat] TURNSTILE FALLBACK: siteverify unreachable (' + String((e && e.name) || e) + ') — cap-only posture for this request');
+    return 'fallback';
+  }
+}
+
 export default {
   async fetch(request, env, ctx) {
     const origin = request.headers.get('Origin');
@@ -1253,6 +1292,16 @@ export default {
         if (!sumCs) return json({ ok: false, error: 'ai' }, 502, origin);
         await brainCountBump(env);
         return json({ ok: true, summary: String(sumCs).slice(0, 600) }, 200, origin);
+      }
+      // Pack DP12 (F-047): Turnstile gate for the PUBLIC chat path. The
+      // internal endpoints above are secret-authed server-to-server calls
+      // and never reach here; the health probe is exempt exactly as it is
+      // from the limiters (a gated probe would report a healthy chat as
+      // down). A 'fallback' verdict proceeds — the limiter, ipday charge
+      // and budgets that already ran / still run are the posture then.
+      if (!probeExempt) {
+        const tsVerdict = await turnstileChat(env, data.turnstileToken, ip);
+        if (tsVerdict === 'reject') return json({ ok: false, error: 'captcha' }, 429, origin);
       }
       let message = typeof data.message === 'string' ? data.message.trim().slice(0, MAX_MSG_LEN) : '';
       const rawMessage = message; // FIX-C1 #4 (QC re-check): the exact-listing matcher runs on the PRE-redaction text — redactPii's phone pattern eats 10-digit runs that are part of a civic address (e.g. "22-15500 102A Avenue" -> "[phone]A Avenue"). The deterministic reply is built only from the listing record, so no visitor text is echoed and nothing unredacted reaches a provider.
