@@ -1,5 +1,5 @@
 // ai-chat worker v4.2 — 2026-10-23 (cycle-16 Claude review fixes applied)
-// Chat cascade: Groq (oss-120b -> llama-70b -> qwen3-32b -> oss-20b) -> Workers AI -> OpenRouter -> Gemini (last backup).
+// Chat cascade: Groq (oss-120b -> groq2/groq3 oss-120b account rotation -> llama-70b -> qwen3-32b -> oss-20b) -> Workers AI -> OpenRouter -> Gemini -> Gemini 2 -> Gemini 3 (last backup).
 // Search chain: Tavily -> Brave -> Exa (last backup).
 // Responses include `via` ONLY for probe requests (X-Chat-Probe header + PROBE_SECRET).
 // Portal brain (2026-11-01): POST /internal/brain — secret-authed task endpoint for the
@@ -10,8 +10,9 @@
 //
 // Bindings: STATE (KV namespace ai-chat-state) — daily budgets + alert throttle.
 //   All KV use fails open (try/catch) so the worker runs without the binding.
-// Secrets (Production): REQUESTY_API_KEY, GROQ_API_KEY, CLOUDFLARE_AI_TOKEN,
-//   OPENROUTER_API_KEY, GEMINI_API_KEY, TAVILY_API_KEY, BRAVE_API_KEY,
+// Secrets (Production): REQUESTY_API_KEY, GROQ_API_KEY, GROQ2_API_KEY,
+//   GROQ3_API_KEY, CLOUDFLARE_AI_TOKEN, OPENROUTER_API_KEY, GEMINI_API_KEY,
+//   GEMINI2_API_KEY, GEMINI3_API_KEY, TAVILY_API_KEY, BRAVE_API_KEY,
 //   EXA_API_KEY, RESEND_API_KEY, PROBE_SECRET.
 // Optional: CF_ACCOUNT_ID (defaults to the account below), ALERT_FROM, ALERT_TO.
 
@@ -51,14 +52,29 @@ const ALLOWED_ORIGINS = [
 // gpt-oss-20b answer almost everything because the two Requesty keys ahead of
 // it are dead (403) — answers felt canned. Requesty entries removed for that
 // reason; re-add at the top if that key is ever revived.
+// Pack AICHAT-EXPANSION (2026-11-19): groq2-oss-120b / groq3-oss-120b are
+// the SAME gpt-oss-120b model on SEPARATE Groq accounts (site pool
+// site-groq-2 / site-groq-3) — account rotation sits BEFORE the model
+// downgrade, because a fresh account's 120b beats the same account's
+// smaller model. gemini2 / gemini3 are the same Gemini model on separate
+// projects (site-gemini-2 / site-gemini-3), appended at the tail, so
+// LAST_CHAT_PROVIDER (derived below) becomes gemini3 — the honest last
+// backup. An entry whose secret is absent is skipped silently by
+// callChat (no fetch, no cooldown, no error), so this table is safe to
+// deploy BEFORE the new secrets are provisioned: until they exist the
+// cascade behaves exactly as it did without these entries.
 const PROVIDERS = [
   { name: 'groq-oss-120b', url: 'https://api.groq.com/openai/v1/chat/completions', key: 'GROQ_API_KEY', model: 'openai/gpt-oss-120b', mt: 1600 },
+  { name: 'groq2-oss-120b', url: 'https://api.groq.com/openai/v1/chat/completions', key: 'GROQ2_API_KEY', model: 'openai/gpt-oss-120b', mt: 1600 },
+  { name: 'groq3-oss-120b', url: 'https://api.groq.com/openai/v1/chat/completions', key: 'GROQ3_API_KEY', model: 'openai/gpt-oss-120b', mt: 1600 },
   { name: 'groq-llama-70b', url: 'https://api.groq.com/openai/v1/chat/completions', key: 'GROQ_API_KEY', model: 'llama-3.3-70b-versatile', mt: 1400 },
   { name: 'groq-qwen', url: 'https://api.groq.com/openai/v1/chat/completions', key: 'GROQ_API_KEY', model: 'qwen/qwen3-32b', mt: 1000 },
   { name: 'groq-oss-20b', url: 'https://api.groq.com/openai/v1/chat/completions', key: 'GROQ_API_KEY', model: 'openai/gpt-oss-20b', mt: 1000 },
   { name: 'workers-ai', kind: 'cf-ai', key: 'CLOUDFLARE_AI_TOKEN', model: '@cf/meta/llama-3.3-70b-instruct-fp8-fast', mt: 1000 },
   { name: 'openrouter', url: 'https://openrouter.ai/api/v1/chat/completions', key: 'OPENROUTER_API_KEY', model: 'meta-llama/llama-3.3-70b-instruct:free', mt: 800 },
-  { name: 'gemini', url: 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', key: 'GEMINI_API_KEY', model: 'gemini-3.5-flash-lite', mt: 1000 }
+  { name: 'gemini', url: 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', key: 'GEMINI_API_KEY', model: 'gemini-3.5-flash-lite', mt: 1000 },
+  { name: 'gemini2', url: 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', key: 'GEMINI2_API_KEY', model: 'gemini-3.5-flash-lite', mt: 1000 },
+  { name: 'gemini3', url: 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', key: 'GEMINI3_API_KEY', model: 'gemini-3.5-flash-lite', mt: 1000 }
 ];
 const LAST_CHAT_PROVIDER = PROVIDERS[PROVIDERS.length - 1].name;
 
@@ -1150,8 +1166,8 @@ export default {
           } else { researchNote = 'Web research unavailable for this task (no results, search error, or daily search budget reached); internal data only.'; }
         }
         const byNameB = {}; for (const pB of PROVIDERS) byNameB[pB.name] = pB;
-        const EXTRACT_ORDER = ['groq-oss-20b', 'groq-qwen', 'groq-oss-120b', 'groq-llama-70b', 'workers-ai', 'openrouter', 'gemini'];
-        const WRITE_ORDER = ['gemini', 'groq-oss-120b', 'groq-llama-70b', 'workers-ai', 'openrouter', 'groq-qwen', 'groq-oss-20b'];
+        const EXTRACT_ORDER = ['groq-oss-20b', 'groq-qwen', 'groq-oss-120b', 'groq2-oss-120b', 'groq3-oss-120b', 'groq-llama-70b', 'workers-ai', 'openrouter', 'gemini'];
+        const WRITE_ORDER = ['gemini', 'gemini2', 'gemini3', 'groq-oss-120b', 'groq-llama-70b', 'workers-ai', 'openrouter', 'groq-qwen', 'groq-oss-20b'];
         const isExtractB = ['extract', 'classify', 'triage', 'intent'].indexOf(taskB) !== -1;
         const chainB = [];
         const paidB = (data.paid && typeof data.paid === 'object' && !Array.isArray(data.paid)) ? data.paid : {};
@@ -1163,7 +1179,7 @@ export default {
         // Critic tasks route to a DIFFERENT first provider family than
         // the writing order (Gemini-first) so the second opinion is not
         // the writer grading its own homework when avoidable.
-        const CRITIC_ORDER = ['groq-oss-120b', 'workers-ai', 'openrouter', 'groq-llama-70b', 'gemini', 'groq-qwen', 'groq-oss-20b'];
+        const CRITIC_ORDER = ['groq-oss-120b', 'groq2-oss-120b', 'groq3-oss-120b', 'workers-ai', 'openrouter', 'groq-llama-70b', 'gemini', 'gemini2', 'gemini3', 'groq-qwen', 'groq-oss-20b'];
         const orderB = taskB === 'critic' ? CRITIC_ORDER : (isExtractB ? EXTRACT_ORDER : WRITE_ORDER);
         /* Pack PM8 (#14b): JSON mode — the advisor sets data.jsonMode
            only for its structured JSON tasks; mark the free-chain
@@ -1284,7 +1300,7 @@ export default {
         const sysCs = 'Summarise this website chat transcript in 2-3 short sentences for the real-estate advisor: what the visitor wants, areas/budget/timeline mentioned, and anything they asked to be contacted about. Use ONLY the transcript. Reply with the summary text only, no preamble.';
         const byNameCs = {}; for (const pCs of PROVIDERS) byNameCs[pCs.name] = pCs;
         let sumCs = '';
-        for (const nmCs of ['groq-oss-20b', 'groq-qwen', 'groq-oss-120b', 'workers-ai', 'gemini']) {
+        for (const nmCs of ['groq-oss-20b', 'groq-qwen', 'groq-oss-120b', 'groq2-oss-120b', 'groq3-oss-120b', 'workers-ai', 'gemini']) {
           const pCs = byNameCs[nmCs]; if (!pCs || inCooldown(pCs.name)) continue;
           const oCs = await callChat(env, Object.assign({}, pCs, { mt: 300 }), sysCs, [{ role: 'user', content: convoCs }]);
           if (oCs && oCs.ok && oCs.text) { sumCs = oCs.text; break; }
